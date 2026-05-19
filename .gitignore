@@ -23,12 +23,6 @@ dist-ssr
 *.sln
 *.sw?
 
-# Local IDE and generated folders
-.cursor
-.gemini
-graphify-out
-GEMINI.md
-.opencode
 
 # Sensitive environment variables
 .env
