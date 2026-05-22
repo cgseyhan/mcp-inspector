@@ -1,5 +1,105 @@
 import React, { useState, useEffect, useRef } from 'react';
 
+const JSON_RPC_TEMPLATES = {
+  'tools/list': {
+    name: 'List Tools',
+    payload: {
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/list',
+      params: {}
+    }
+  },
+  'tools/call': {
+    name: 'Call Tool (Weather Example)',
+    payload: {
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: {
+        name: 'get_weather',
+        arguments: {
+          city: 'Istanbul',
+          unit: 'celsius'
+        }
+      }
+    }
+  },
+  'resources/list': {
+    name: 'List Resources',
+    payload: {
+      jsonrpc: '2.0',
+      id: 4,
+      method: 'resources/list',
+      params: {}
+    }
+  },
+  'resources/read': {
+    name: 'Read Resource (Alerts Example)',
+    payload: {
+      jsonrpc: '2.0',
+      id: 5,
+      method: 'resources/read',
+      params: {
+        uri: 'file://weather/alerts.txt'
+      }
+    }
+  },
+  'prompts/list': {
+    name: 'List Prompts',
+    payload: {
+      jsonrpc: '2.0',
+      id: 6,
+      method: 'prompts/list',
+      params: {}
+    }
+  },
+  'prompts/get': {
+    name: 'Get Prompt (Weather Summary Example)',
+    payload: {
+      jsonrpc: '2.0',
+      id: 7,
+      method: 'prompts/get',
+      params: {
+        name: 'summarize_weather',
+        arguments: {
+          city: 'Paris',
+          mood: 'friendly'
+        }
+      }
+    }
+  },
+  'initialize': {
+    name: 'Initialize (Handshake)',
+    payload: {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities: {
+          tools: {},
+          resources: {},
+          prompts: {}
+        },
+        clientInfo: {
+          name: 'mcp-test-harness',
+          version: '1.0.0'
+        }
+      }
+    }
+  },
+  'custom': {
+    name: 'Custom (Blank Request)',
+    payload: {
+      jsonrpc: '2.0',
+      id: 8,
+      method: 'custom_method',
+      params: {}
+    }
+  }
+};
+
 function App() {
   // Connection Form State
   const [connectionType, setConnectionType] = useState('stdio');
@@ -30,19 +130,33 @@ function App() {
   // Logs & terminal states
   const [rpcLogs, setRpcLogs] = useState([]);
   const [stderrLogs, setStderrLogs] = useState([]);
-  const [consoleTab, setConsoleTab] = useState('rpc'); // 'rpc' | 'stderr'
+  const [consoleTab, setConsoleTab] = useState('rpc'); // 'rpc' | 'stderr' | 'performance'
   const [expandedRpcId, setExpandedRpcId] = useState(null);
   const [logSearch, setLogSearch] = useState('');
   const [autoScroll, setAutoScroll] = useState(true);
   const [isLogFrozen, setIsLogFrozen] = useState(false);
+  const [currentResource, setCurrentResource] = useState(null);
+  const [resourceHistory, setResourceHistory] = useState([]);
 
   // Presets states
   const [presets, setPresets] = useState([]);
   const [newPresetName, setNewPresetName] = useState('');
 
+  // Scratchpad states
+  const [scratchpadPayload, setScratchpadPayload] = useState('{\n  "jsonrpc": "2.0",\n  "id": 2,\n  "method": "tools/list",\n  "params": {}\n}');
+  const [isValidJson, setIsValidJson] = useState(true);
+  const [jsonParseError, setJsonParseError] = useState(null);
+  const [scratchpadProfiles, setScratchpadProfiles] = useState([]);
+  const [newScratchpadProfileName, setNewScratchpadProfileName] = useState('');
+  const [selectedTemplate, setSelectedTemplate] = useState('tools/list');
+  const [scratchpadLastRequest, setScratchpadLastRequest] = useState(null);
+  const [scratchpadLastResponse, setScratchpadLastResponse] = useState(null);
+  const [scratchpadMetrics, setScratchpadMetrics] = useState({ latency: null, size: null, status: null });
+
   // Refs for tracking
   const wsRef = useRef(null);
   const rpcCounter = useRef(0);
+
   const pendingRequests = useRef({});
   const stderrEndRef = useRef(null);
   const rpcEndRef = useRef(null);
@@ -86,6 +200,30 @@ function App() {
       ];
       setPresets(defaults);
       localStorage.setItem('mcp_presets', JSON.stringify(defaults));
+    }
+
+    // Load Scratchpad profiles from LocalStorage on mount
+    const savedProfiles = localStorage.getItem('mcp_scratchpad_profiles');
+    if (savedProfiles) {
+      try {
+        setScratchpadProfiles(JSON.parse(savedProfiles));
+      } catch (e) {
+        console.error('Failed to parse scratchpad profiles', e);
+      }
+    } else {
+      // Default scratchpad profiles
+      const defaultProfiles = [
+        {
+          name: 'List Available Tools',
+          payload: JSON.stringify(JSON_RPC_TEMPLATES['tools/list'].payload, null, 2)
+        },
+        {
+          name: 'Get Weather Istanbul',
+          payload: JSON.stringify(JSON_RPC_TEMPLATES['tools/call'].payload, null, 2)
+        }
+      ];
+      setScratchpadProfiles(defaultProfiles);
+      localStorage.setItem('mcp_scratchpad_profiles', JSON.stringify(defaultProfiles));
     }
 
     // Connect WebSocket to backend helper
@@ -137,11 +275,25 @@ function App() {
               setResources([]);
               setPrompts([]);
               setSelectedItem(null);
+              setCurrentResource(null);
+              setResourceHistory([]);
             }
             if (msg.status === 'connected') {
               // Initiate Handshake!
               sendInitializeHandshake();
             }
+            break;
+
+          case 'resource-usage':
+            setCurrentResource({ cpu: msg.cpu, memory: msg.memory, pid: msg.pid });
+            setResourceHistory((prev) => {
+              const newPoint = {
+                time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+                cpu: msg.cpu,
+                memory: msg.memory / (1024 * 1024) // in MB
+              };
+              return [...prev, newPoint].slice(-25); // cap at last 25 historical data points
+            });
             break;
 
           case 'stdout-line':
@@ -229,10 +381,14 @@ function App() {
       // Log the JSON-RPC packet
       let latency = null;
       let reqMethod = null;
+      let isScratchpadResponse = false;
       if (id !== undefined && pendingRequests.current[id]) {
         const pending = pendingRequests.current[id];
         latency = Math.round(performance.now() - pending.startTime);
         reqMethod = pending.method;
+        if (pending.isScratchpad) {
+          isScratchpadResponse = true;
+        }
         delete pendingRequests.current[id];
       }
 
@@ -305,6 +461,16 @@ function App() {
             status: error ? 'error' : 'success'
           }));
         }
+        
+        // Scratchpad or other unhandled packet fallback
+        else {
+          setScratchpadLastResponse(packet);
+          setScratchpadMetrics({
+            latency: latency,
+            size: new Blob([line]).size,
+            status: error ? 'error' : 'success'
+          });
+        }
       }
     } catch (e) {
       console.error('Failed to parse stdout packet:', e);
@@ -367,6 +533,146 @@ function App() {
       type: 'send-rpc',
       payload
     }));
+  };
+
+  // Scratchpad Helpers
+  const handleScratchpadChange = (val) => {
+    setScratchpadPayload(val);
+    try {
+      JSON.parse(val);
+      setIsValidJson(true);
+      setJsonParseError(null);
+    } catch (e) {
+      setIsValidJson(false);
+      setJsonParseError(e.message);
+    }
+  };
+
+  const handlePrettifyJson = () => {
+    try {
+      const parsed = JSON.parse(scratchpadPayload);
+      const formatted = JSON.stringify(parsed, null, 2);
+      setScratchpadPayload(formatted);
+      setIsValidJson(true);
+      setJsonParseError(null);
+    } catch (e) {
+      // Cannot prettify invalid JSON
+    }
+  };
+
+  const handleSaveScratchpadProfile = (e) => {
+    e.preventDefault();
+    if (!newScratchpadProfileName.trim()) return;
+    const profile = {
+      name: newScratchpadProfileName,
+      payload: scratchpadPayload
+    };
+    const updated = [...scratchpadProfiles, profile];
+    setScratchpadProfiles(updated);
+    localStorage.setItem('mcp_scratchpad_profiles', JSON.stringify(updated));
+    setNewScratchpadProfileName('');
+  };
+
+  const handleLoadScratchpadProfile = (profile) => {
+    setScratchpadPayload(profile.payload);
+    try {
+      JSON.parse(profile.payload);
+      setIsValidJson(true);
+      setJsonParseError(null);
+    } catch (e) {
+      setIsValidJson(false);
+      setJsonParseError(e.message);
+    }
+  };
+
+  const handleDeleteScratchpadProfile = (indexToDelete, e) => {
+    e.stopPropagation();
+    const updated = scratchpadProfiles.filter((_, i) => i !== indexToDelete);
+    setScratchpadProfiles(updated);
+    localStorage.setItem('mcp_scratchpad_profiles', JSON.stringify(updated));
+  };
+
+  const handleLoadTemplate = (templateKey) => {
+    setSelectedTemplate(templateKey);
+    const template = JSON_RPC_TEMPLATES[templateKey];
+    if (template) {
+      const payloadString = JSON.stringify(template.payload, null, 2);
+      setScratchpadPayload(payloadString);
+      setIsValidJson(true);
+      setJsonParseError(null);
+    }
+  };
+
+  const handleSendScratchpad = () => {
+    if (status !== 'connected' || !wsRef.current || wsRef.current.readyState !== 1) {
+      alert("Error: Server not connected.");
+      return;
+    }
+    try {
+      const payload = JSON.parse(scratchpadPayload);
+      
+      // Auto-assign ID if missing
+      if (payload.id === undefined) {
+        payload.id = `req-${rpcCounter.current++}`;
+      }
+
+      setScratchpadLastRequest(payload);
+      setScratchpadLastResponse(null);
+      setScratchpadMetrics({ latency: null, size: null, status: 'running' });
+
+      pendingRequests.current[payload.id] = {
+        method: payload.method || 'scratchpad-call',
+        startTime: performance.now(),
+        isScratchpad: true // Flag to identify scratchpad requests
+      };
+
+      appendRpcLog('sent', payload);
+      wsRef.current.send(JSON.stringify({
+        type: 'send-rpc',
+        payload
+      }));
+    } catch (e) {
+      alert(`Invalid JSON payload: ${e.message}`);
+    }
+  };
+
+  const handleReplayPacket = (payload) => {
+    if (status !== 'connected' || !wsRef.current || wsRef.current.readyState !== 1) {
+      alert("Error: Server not connected.");
+      return;
+    }
+    // Clone the packet
+    const clonedPayload = JSON.parse(JSON.stringify(payload));
+    
+    // Assign a fresh ID if it was a request (had an ID)
+    if (clonedPayload.id !== undefined) {
+      clonedPayload.id = `req-${rpcCounter.current++}`;
+      pendingRequests.current[clonedPayload.id] = {
+        method: clonedPayload.method || 'replay-call',
+        startTime: performance.now()
+      };
+    }
+    
+    appendRpcLog('sent', clonedPayload);
+    wsRef.current.send(JSON.stringify({
+      type: 'send-rpc',
+      payload: clonedPayload
+    }));
+  };
+
+  const handleEditInScratchpad = (payload) => {
+    // Switch to scratchpad tab
+    setActiveTab('scratchpad');
+    setSelectedItem(null);
+    
+    // Clone payload
+    const clonedPayload = JSON.parse(JSON.stringify(payload));
+    
+    // Prettify it
+    const formatted = JSON.stringify(clonedPayload, null, 2);
+    setScratchpadPayload(formatted);
+    setIsValidJson(true);
+    setJsonParseError(null);
   };
 
   // Connection trigger button
@@ -617,6 +923,51 @@ function App() {
     return log.toLowerCase().includes(logSearch.toLowerCase());
   });
 
+  // SVG Chart Dimensions for Real-Time Performance Monitor
+  const chartPaddingLeft = 32;
+  const chartPaddingRight = 32;
+  const chartPaddingTop = 20;
+  const chartPaddingBottom = 26;
+  const chartSvgWidth = 440;
+  const chartSvgHeight = 180;
+  const chartAreaWidth = chartSvgWidth - chartPaddingLeft - chartPaddingRight; // 376
+  const chartAreaHeight = chartSvgHeight - chartPaddingTop - chartPaddingBottom; // 134
+  
+  const historyMaxMem = Math.max(...resourceHistory.map(p => p.memory), 32); // floor at 32MB
+  
+  let cpuPathD = "";
+  let cpuAreaPathD = "";
+  let memPathD = "";
+  let memAreaPathD = "";
+  
+  if (resourceHistory.length > 0) {
+    const len = resourceHistory.length;
+    resourceHistory.forEach((pt, i) => {
+      const x = chartPaddingLeft + (i / Math.max(1, len - 1)) * chartAreaWidth;
+      const yCpu = chartPaddingTop + chartAreaHeight - (Math.min(100, Math.max(0, pt.cpu)) / 100) * chartAreaHeight;
+      const yMem = chartPaddingTop + chartAreaHeight - (Math.min(historyMaxMem, Math.max(0, pt.memory)) / historyMaxMem) * chartAreaHeight;
+      
+      if (i === 0) {
+        cpuPathD = `M ${x} ${yCpu}`;
+        cpuAreaPathD = `M ${x} ${chartPaddingTop + chartAreaHeight} L ${x} ${yCpu}`;
+        
+        memPathD = `M ${x} ${yMem}`;
+        memAreaPathD = `M ${x} ${chartPaddingTop + chartAreaHeight} L ${x} ${yMem}`;
+      } else {
+        cpuPathD += ` L ${x} ${yCpu}`;
+        cpuAreaPathD += ` L ${x} ${yCpu}`;
+        
+        memPathD += ` L ${x} ${yMem}`;
+        memAreaPathD += ` L ${x} ${yMem}`;
+      }
+      
+      if (i === len - 1) {
+        cpuAreaPathD += ` L ${x} ${chartPaddingTop + chartAreaHeight} Z`;
+        memAreaPathD += ` L ${x} ${chartPaddingTop + chartAreaHeight} Z`;
+      }
+    });
+  }
+
   return (
     <div className="app-container">
       {/* Header bar */}
@@ -815,6 +1166,12 @@ function App() {
                 >
                   Prompts ({prompts.length})
                 </button>
+                <button
+                  className={`tab-btn ${activeTab === 'scratchpad' ? 'active' : ''}`}
+                  onClick={() => { setActiveTab('scratchpad'); setSelectedItem(null); }}
+                >
+                  Scratchpad 📝
+                </button>
               </div>
 
               <div className="tester-main">
@@ -876,11 +1233,227 @@ function App() {
                       )}
                     </div>
                   )}
+
+                  {activeTab === 'scratchpad' && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                      <div>
+                        <label className="form-label" style={{ fontWeight: '600' }}>JSON-RPC Templates</label>
+                        <select
+                          className="form-control"
+                          value={selectedTemplate}
+                          onChange={(e) => handleLoadTemplate(e.target.value)}
+                          style={{ marginTop: '4px' }}
+                        >
+                          {Object.entries(JSON_RPC_TEMPLATES).map(([key, template]) => (
+                            <option key={key} value={key}>{template.name}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>
+                        <span className="form-label" style={{ fontWeight: '600' }}>Saved Profiles</span>
+                        
+                        <form onSubmit={handleSaveScratchpadProfile} className="key-value-row" style={{ marginTop: '8px', gridTemplateColumns: '1fr auto', gap: '6px' }}>
+                          <input
+                            type="text"
+                            className="form-control"
+                            placeholder="Profile name..."
+                            value={newScratchpadProfileName}
+                            onChange={(e) => setNewScratchpadProfileName(e.target.value)}
+                          />
+                          <button type="submit" className="btn btn-secondary btn-sm" style={{padding: '9px 12px'}}>Save</button>
+                        </form>
+
+                        <div className="preset-list" style={{ marginTop: '12px' }}>
+                          {scratchpadProfiles.length === 0 ? (
+                            <div style={{ fontSize: '11px', color: 'var(--text-muted)', textAlign: 'center', padding: '12px' }}>
+                              No saved profiles yet.
+                            </div>
+                          ) : (
+                            scratchpadProfiles.map((profile, idx) => (
+                              <div
+                                key={idx}
+                                className="preset-item"
+                                style={{ cursor: 'pointer' }}
+                                onClick={() => handleLoadScratchpadProfile(profile)}
+                              >
+                                <div className="preset-item-info" style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                  <span className="preset-item-name">{profile.name}</span>
+                                </div>
+                                <button
+                                  className="btn btn-danger btn-sm"
+                                  style={{ padding: '2px 6px', fontSize: '10px' }}
+                                  onClick={(e) => handleDeleteScratchpadProfile(idx, e)}
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            ))
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* Call panel executor */}
                 <div className="tester-runner">
-                  {!selectedItem ? (
+                  {activeTab === 'scratchpad' ? (
+                    <div className="scratchpad-container">
+                      <div className="scratchpad-workspace">
+                        {/* Editor Pane (Left Side) */}
+                        <div className="scratchpad-editor-pane">
+                          <div className="scratchpad-toolbar">
+                            <div className="scratchpad-toolbar-group">
+                              <span className="form-label" style={{ margin: 0, fontWeight: '600' }}>Request Editor</span>
+                            </div>
+                            <div className="scratchpad-toolbar-group">
+                              <button
+                                className="btn btn-secondary btn-sm"
+                                onClick={handlePrettifyJson}
+                                disabled={!isValidJson}
+                              >
+                                Prettify JSON
+                              </button>
+                            </div>
+                          </div>
+                          
+                          <div className={`code-editor-wrapper ${isValidJson ? 'valid' : 'invalid'}`}>
+                            <div className="code-editor-header">
+                              <span>JSON Payload</span>
+                              <span className={`badge ${isValidJson ? 'badge-success' : 'badge-error'}`}>
+                                {isValidJson ? 'JSON Valid' : 'JSON Invalid'}
+                              </span>
+                            </div>
+                            <textarea
+                              className="code-editor-textarea"
+                              value={scratchpadPayload}
+                              onChange={(e) => handleScratchpadChange(e.target.value)}
+                              spellCheck="false"
+                              placeholder="Enter raw JSON-RPC request here..."
+                            />
+                          </div>
+                          
+                          {/* Validation Feed */}
+                          {jsonParseError ? (
+                            <div className="validation-feed invalid">
+                              <span>⚠️ {jsonParseError}</span>
+                            </div>
+                          ) : (
+                            <div className="validation-feed valid">
+                              <span>✅ Ready to send valid JSON-RPC packet.</span>
+                            </div>
+                          )}
+
+                          <div style={{ marginTop: '12px' }}>
+                            <button
+                              className="btn btn-primary"
+                              style={{ width: '100%', padding: '12px', fontWeight: '600' }}
+                              onClick={handleSendScratchpad}
+                              disabled={!isValidJson || status !== 'connected'}
+                            >
+                              Send Packet ⚡
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Response Pane (Right Side) */}
+                        <div className="scratchpad-response-pane">
+                          <div className="scratchpad-toolbar">
+                            <span className="form-label" style={{ margin: 0, fontWeight: '600' }}>Response Console</span>
+                          </div>
+
+                          {/* Metrics bar */}
+                          <div className="metrics-bar" style={{ marginBottom: '12px' }}>
+                            <div className="metric-item">
+                              <span className="metric-label">Latency</span>
+                              <span className="metric-value" style={{ color: scratchpadMetrics.latency > 500 ? 'var(--color-warning)' : 'var(--color-success)' }}>
+                                {scratchpadMetrics.latency !== null ? `${scratchpadMetrics.latency} ms` : '-'}
+                              </span>
+                            </div>
+                            <div className="metric-item">
+                              <span className="metric-label">Payload Size</span>
+                              <span className="metric-value">
+                                {scratchpadMetrics.size !== null ? `${(scratchpadMetrics.size / 1024).toFixed(2)} KB` : '-'}
+                              </span>
+                            </div>
+                            <div className="metric-item">
+                              <span className="metric-label">Status</span>
+                              <span className={`metric-value ${scratchpadMetrics.status === 'success' ? 'badge-success' : scratchpadMetrics.status === 'error' ? 'badge-error' : scratchpadMetrics.status === 'running' ? 'badge-warning' : 'badge-neutral'}`} style={{padding: '2px 8px', borderRadius: '4px', fontSize: '11px', textTransform: 'uppercase'}}>
+                                {scratchpadMetrics.status || 'idle'}
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* Output Display */}
+                          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '12px', overflowY: 'auto', paddingRight: '4px' }}>
+                            {scratchpadLastResponse ? (
+                              <>
+                                {/* Image Output rendering */}
+                                {scratchpadLastResponse.result?.content?.map((item, index) => {
+                                  if (item.type === 'image' && item.data) {
+                                    return (
+                                      <div key={index} className="card" style={{ display: 'inline-block', maxWidth: '100%' }}>
+                                        <div className="card-title">Image Output</div>
+                                        <img
+                                          src={`data:${item.mimeType || 'image/png'};base64,${item.data}`}
+                                          alt="Tool generated result"
+                                          style={{ maxWidth: '100%', borderRadius: 'var(--border-radius-md)', display: 'block' }}
+                                        />
+                                      </div>
+                                    );
+                                  }
+                                  return null;
+                                })}
+
+                                {/* Rich Text Response rendering */}
+                                {scratchpadLastResponse.result?.content?.map((item, index) => {
+                                  if (item.type === 'text' && item.text) {
+                                    return (
+                                      <div key={index} className="card" style={{ whiteSpace: 'pre-wrap', lineHeight: '1.5', borderLeft: '3px solid var(--accent-cyan)' }}>
+                                        {item.text}
+                                      </div>
+                                    );
+                                  }
+                                  return null;
+                                })}
+
+                                {/* Full Raw JSON Response */}
+                                <div>
+                                  <div className="form-label" style={{ fontSize: '11px' }}>Raw JSON Response</div>
+                                  <pre className="json-view" style={{ maxHeight: '250px', overflowY: 'auto' }}>
+                                    {JSON.stringify(scratchpadLastResponse, null, 2)}
+                                  </pre>
+                                </div>
+                              </>
+                            ) : scratchpadMetrics.status === 'running' ? (
+                              <div className="empty-state" style={{ flex: 1, justifyContent: 'center' }}>
+                                <span className="empty-state-icon" style={{ display: 'inline-block', animation: 'spin 1.5s linear infinite' }}>⏳</span>
+                                <span className="empty-state-title">Awaiting Response</span>
+                                <span className="empty-state-desc">Sent request. Waiting for JSON-RPC response from the server...</span>
+                              </div>
+                            ) : (
+                              <div className="empty-state" style={{ flex: 1, justifyContent: 'center' }}>
+                                <span className="empty-state-icon">📡</span>
+                                <span className="empty-state-title">Console Idle</span>
+                                <span className="empty-state-desc">Configure your JSON payload and click Send Packet to view real-time RPC outcomes here.</span>
+                              </div>
+                            )}
+
+                            {/* Request JSON payload for reference */}
+                            {scratchpadLastRequest && (
+                              <div style={{ marginTop: '8px' }}>
+                                <div className="form-label" style={{ fontSize: '11px' }}>Last Sent JSON Request</div>
+                                <pre className="json-view" style={{ color: '#60a5fa', borderColor: 'rgba(96, 165, 250, 0.2)', maxHeight: '150px', overflowY: 'auto' }}>
+                                  {JSON.stringify(scratchpadLastRequest, null, 2)}
+                                </pre>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ) : !selectedItem ? (
                     <div className="empty-state" style={{paddingTop: '80px'}}>
                       <span className="empty-state-icon">👈</span>
                       <span className="empty-state-title">Select an Item</span>
@@ -1084,6 +1657,13 @@ function App() {
             >
               Stderr / Console ({filteredStderrLogs.length})
             </button>
+            <button
+              className={`tab-btn ${consoleTab === 'performance' ? 'active' : ''}`}
+              style={{ flex: 1, padding: '10px' }}
+              onClick={() => setConsoleTab('performance')}
+            >
+              Performance 📈
+            </button>
           </div>
 
           <div className="panel-content" style={{ padding: '10px', display: 'flex', flexDirection: 'column' }}>
@@ -1121,6 +1701,31 @@ function App() {
                               {log.latency ? `${log.latency}ms` : ''} [{log.timestamp}]
                             </span>
                           </div>
+
+                          {log.direction === 'sent' && (
+                            <div className="rpc-actions">
+                              <button
+                                className="rpc-action-btn"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleReplayPacket(log.payload);
+                                }}
+                                title="Re-send this JSON-RPC request packet instantly"
+                              >
+                                ⚡ Quick Replay
+                              </button>
+                              <button
+                                className="rpc-action-btn"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleEditInScratchpad(log.payload);
+                                }}
+                                title="Copy packet payload to the Scratchpad workspace for modifications"
+                              >
+                                📝 Edit in Scratchpad
+                              </button>
+                            </div>
+                          )}
 
                           {isExpanded && (
                             <pre className="rpc-details">
@@ -1169,6 +1774,131 @@ function App() {
                   )}
                   <div ref={stderrEndRef} />
                 </div>
+              </div>
+            )}
+
+            {/* Performance Monitoring Tab */}
+            {consoleTab === 'performance' && (
+              <div className="perf-dashboard">
+                {connectionType === 'sse' ? (
+                  <div className="perf-warning-card">
+                    <div className="perf-warning-title">⚠️ PERFORMANS İZLEME DESTEKLENMİYOR</div>
+                    <div>
+                      Uzaktaki Server-Sent Events (SSE) bağlantıları için canlı kaynak tüketim izleme desteklenmemektedir.
+                    </div>
+                    <div style={{ opacity: 0.8, fontSize: '11px', marginTop: '4px' }}>
+                      Bu özellik yalnızca yerel makinede başlatılan Stdio alt süreçleri (Subprocess) için kullanılabilir.
+                    </div>
+                  </div>
+                ) : status !== 'connected' ? (
+                  <div className="perf-fallback">
+                    <div className="perf-fallback-icon">📡</div>
+                    <div style={{ fontWeight: '600', color: 'var(--text-secondary)' }}>
+                      Sunucu Bağlantısı Bekleniyor
+                    </div>
+                    <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                      Kaynak kullanımını izlemek için lütfen sunucuyu başlatın veya bağlanın.
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    {/* Metrics Grid */}
+                    <div className="perf-metrics-grid">
+                      <div className="perf-card">
+                        <span className="perf-card-title">Alt Süreç PID</span>
+                        <span className="perf-card-value">{currentResource?.pid || '...'}</span>
+                      </div>
+                      <div className="perf-card">
+                        <span className="perf-card-title">İşlemci (CPU)</span>
+                        <span className="perf-card-value cyan">
+                          {currentResource ? `${currentResource.cpu.toFixed(1)}%` : '0.0%'}
+                        </span>
+                      </div>
+                      <div className="perf-card">
+                        <span className="perf-card-title">Bellek (RAM)</span>
+                        <span className="perf-card-value purple">
+                          {currentResource ? `${(currentResource.memory / (1024 * 1024)).toFixed(1)} MB` : '0.0 MB'}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Chart Container */}
+                    <div className="chart-container">
+                      <div className="chart-header">
+                        <span className="chart-title">Zaman Serisi Geçmişi</span>
+                        <div className="chart-legend">
+                          <div className="legend-item">
+                            <span className="legend-dot cyan"></span>
+                            <span>CPU</span>
+                          </div>
+                          <div className="legend-item">
+                            <span className="legend-dot purple"></span>
+                            <span>RAM</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* SVG Live Chart */}
+                      {resourceHistory.length <= 1 ? (
+                        <div style={{ height: '120px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: '11px', fontFamily: 'var(--font-mono)' }}>
+                          Veri toplanıyor... (1.5sn aralıklarla güncellenir)
+                        </div>
+                      ) : (
+                        <svg className="svg-chart" viewBox={`0 0 ${chartSvgWidth} ${chartSvgHeight}`}>
+                          <defs>
+                            {/* Gradients */}
+                            <linearGradient id="cpuGradient" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="0%" stopColor="var(--accent-cyan)" stopOpacity="0.25" />
+                              <stop offset="100%" stopColor="var(--accent-cyan)" stopOpacity="0.0" />
+                            </linearGradient>
+                            <linearGradient id="memGradient" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="0%" stopColor="#d946ef" stopOpacity="0.25" />
+                              <stop offset="100%" stopColor="#d946ef" stopOpacity="0.0" />
+                            </linearGradient>
+                          </defs>
+
+                          {/* Grid Lines */}
+                          <line x1={chartPaddingLeft} y1={chartPaddingTop} x2={chartSvgWidth - chartPaddingRight} y2={chartPaddingTop} className="grid-line" />
+                          <line x1={chartPaddingLeft} y1={chartPaddingTop + chartAreaHeight / 2} x2={chartSvgWidth - chartPaddingRight} y2={chartPaddingTop + chartAreaHeight / 2} className="grid-line" />
+                          <line x1={chartPaddingLeft} y1={chartPaddingTop + chartAreaHeight} x2={chartSvgWidth - chartPaddingRight} y2={chartPaddingTop + chartAreaHeight} className="grid-line" />
+
+                          <line x1={chartPaddingLeft} y1={chartPaddingTop} x2={chartPaddingLeft} y2={chartPaddingTop + chartAreaHeight} className="grid-line" />
+                          <line x1={chartPaddingLeft + chartAreaWidth / 2} y1={chartPaddingTop} x2={chartPaddingLeft + chartAreaWidth / 2} y2={chartPaddingTop + chartAreaHeight} className="grid-line" />
+                          <line x1={chartPaddingLeft + chartAreaWidth} y1={chartPaddingTop} x2={chartPaddingLeft + chartAreaWidth} y2={chartPaddingTop + chartAreaHeight} className="grid-line" />
+
+                          {/* Y-Axis Labels */}
+                          <text x={chartPaddingLeft - 8} y={chartPaddingTop + 4} textAnchor="end" className="tick-text">100%</text>
+                          <text x={chartPaddingLeft - 8} y={chartPaddingTop + chartAreaHeight / 2 + 4} textAnchor="end" className="tick-text">50%</text>
+                          <text x={chartPaddingLeft - 8} y={chartPaddingTop + chartAreaHeight + 4} textAnchor="end" className="tick-text">0%</text>
+
+                          <text x={chartSvgWidth - chartPaddingRight + 8} y={chartPaddingTop + 4} textAnchor="start" className="tick-text" fill="#d946ef">{historyMaxMem.toFixed(0)}M</text>
+                          <text x={chartSvgWidth - chartPaddingRight + 8} y={chartPaddingTop + chartAreaHeight / 2 + 4} textAnchor="start" className="tick-text" fill="#d946ef">{(historyMaxMem / 2).toFixed(0)}M</text>
+                          <text x={chartSvgWidth - chartPaddingRight + 8} y={chartPaddingTop + chartAreaHeight + 4} textAnchor="start" className="tick-text" fill="#d946ef">0M</text>
+
+                          {/* Axis Lines */}
+                          <line x1={chartPaddingLeft} y1={chartPaddingTop + chartAreaHeight} x2={chartSvgWidth - chartPaddingRight} y2={chartPaddingTop + chartAreaHeight} className="axis-line" />
+                          <line x1={chartPaddingLeft} y1={chartPaddingTop} x2={chartPaddingLeft} y2={chartPaddingTop + chartAreaHeight} className="axis-line" />
+
+                          {/* Area under curves */}
+                          {cpuAreaPathD && <path d={cpuAreaPathD} fill="url(#cpuGradient)" style={{ transition: 'all 0.3s ease' }} />}
+                          {memAreaPathD && <path d={memAreaPathD} fill="url(#memGradient)" style={{ transition: 'all 0.3s ease' }} />}
+
+                          {/* Line Paths */}
+                          {cpuPathD && <path d={cpuPathD} className="chart-path-cpu" style={{ transition: 'all 0.3s ease' }} />}
+                          {memPathD && <path d={memPathD} className="chart-path-mem" style={{ transition: 'all 0.3s ease' }} />}
+
+                          {/* Bottom Timestamps (First and Last) */}
+                          <text x={chartPaddingLeft} y={chartSvgHeight - 8} textAnchor="start" className="tick-text">
+                            {resourceHistory[0]?.time || ''}
+                          </text>
+                          <text x={chartPaddingLeft + chartAreaWidth} y={chartSvgHeight - 8} textAnchor="end" className="tick-text">
+                            {resourceHistory[resourceHistory.length - 1]?.time || ''}
+                          </text>
+                        </svg>
+                      )}
+                    </div>
+                  </>
+                )}
               </div>
             )}
             

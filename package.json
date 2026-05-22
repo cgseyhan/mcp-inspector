@@ -8,11 +8,13 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "server": "node server/index.js"
+    "server": "node server/index.js",
+    "test": "python tests/test_mcp_inspector.py"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
+    "pidusage": "^4.0.1",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
     "ws": "^8.18.0"

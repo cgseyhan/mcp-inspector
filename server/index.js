@@ -5,6 +5,7 @@ import cors from 'cors';
 import { spawn } from 'child_process';
 import readline from 'readline';
 import { EventEmitter } from 'events';
+import pidusage from 'pidusage';
 
 const app = express();
 app.use(cors());
@@ -18,6 +19,7 @@ let activeProcess = null;
 let activeProcessInterface = null;
 let connectionStatus = 'disconnected'; // 'disconnected' | 'connecting' | 'connected' | 'crashed'
 let activeConfig = null;
+let resourcePollingInterval = null;
 
 // SSE Proxy states
 let sseController = null;
@@ -188,6 +190,37 @@ async function handleConnectStdio(config, ws) {
       message: 'Server process spawned. Initializing handshake...'
     });
 
+    // Start polling resource usage
+    if (resourcePollingInterval) {
+      clearInterval(resourcePollingInterval);
+    }
+    resourcePollingInterval = setInterval(async () => {
+      if (!activeProcess || activeProcess.killed) {
+        if (resourcePollingInterval) {
+          clearInterval(resourcePollingInterval);
+          resourcePollingInterval = null;
+        }
+        return;
+      }
+      try {
+        const stats = await pidusage(activeProcess.pid);
+        broadcast({
+          type: 'resource-usage',
+          pid: activeProcess.pid,
+          cpu: stats.cpu,
+          memory: stats.memory,
+          timestamp: Date.now()
+        });
+      } catch (err) {
+        console.error('Error polling pidusage:', err);
+        if (resourcePollingInterval) {
+          clearInterval(resourcePollingInterval);
+          resourcePollingInterval = null;
+        }
+        pidusage.clear();
+      }
+    }, 1500);
+
   } catch (err) {
     console.error('Error spawning process:', err);
     broadcast({
@@ -203,6 +236,11 @@ async function handleConnectStdio(config, ws) {
 function cleanupProcess() {
   activeProcess = null;
   activeProcessInterface = null;
+  if (resourcePollingInterval) {
+    clearInterval(resourcePollingInterval);
+    resourcePollingInterval = null;
+  }
+  pidusage.clear();
 }
 
 // 2. Terminating active connections
